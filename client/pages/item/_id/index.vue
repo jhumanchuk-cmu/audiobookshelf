@@ -389,6 +389,13 @@ export default {
         })
       }
 
+      if (this.isBook) {
+        items.push({
+          text: this.$strings.LabelExportBookmarks,
+          action: 'export-bookmarks'
+        })
+      }
+
       if (this.showRssFeedBtn) {
         items.push({
           text: this.$strings.LabelOpenRSSFeed,
@@ -765,6 +772,8 @@ export default {
         this.$store.commit('globals/setShowPlaylistsModal', true)
       } else if (action === 'bookmarks') {
         this.showBookmarksModal = true
+      } else if (action === 'export-bookmarks') {
+        this.exportBookmarks()
       } else if (action === 'rss-feeds') {
         this.clickRSSFeed()
       } else if (action === 'download') {
@@ -777,7 +786,42 @@ export default {
         this.$store.commit('setSelectedLibraryItem', this.libraryItem)
         this.$store.commit('globals/setShareModal', this.mediaItemShare)
       }
-    }
+    },
+    async exportBookmarks() {
+      const safeTitle = this.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'book'
+      const filename = `${safeTitle}-bookmarks.json`
+
+      try {
+        let fileHandle = null
+        if (window.showSaveFilePicker) {
+          fileHandle = await window.showSaveFilePicker({
+            suggestedName: filename,
+            types: [{ description: 'JSON file', accept: { 'application/json': ['.json'] } }]
+          })
+        }
+
+        const file = await this.$axios.$get(`/api/me/item/${this.libraryItemId}/bookmarks/export`, { responseType: 'blob' })
+        if (fileHandle) {
+          const writable = await fileHandle.createWritable()
+          await writable.write(file)
+          await writable.close()
+        } else {
+          const fileUrl = URL.createObjectURL(file)
+          const link = document.createElement('a')
+          link.href = fileUrl
+          link.download = filename
+          document.body.appendChild(link)
+          link.click()
+          link.remove()
+          setTimeout(() => URL.revokeObjectURL(fileUrl), 0)
+        }
+        this.$toast.success(this.$strings.ToastExportBookmarksSuccess)
+      } catch (error) {
+        if (error.name === 'AbortError') return
+        this.$toast.error(this.$strings.ToastExportBookmarksFailed)
+        console.error('Failed to export bookmarks', error)
+      }
+    },
   },
   mounted() {
     this.checkDescriptionClamped()

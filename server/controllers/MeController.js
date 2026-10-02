@@ -4,7 +4,7 @@ const Logger = require('../Logger')
 const SocketAuthority = require('../SocketAuthority')
 const Database = require('../Database')
 const { sort } = require('../libs/fastSort')
-const { toNumber, isNullOrNaN, isUUID } = require('../utils/index')
+const { toNumber, isUUID } = require('../utils/index')
 const userStats = require('../utils/queries/userStats')
 const parseUserAgent = require('../utils/parsers/parseUserAgent')
 
@@ -15,7 +15,7 @@ const parseUserAgent = require('../utils/parsers/parseUserAgent')
  * @typedef {Request & RequestUserObject} RequestWithUser
  */
 
-class MeController {
+class MeControllerClass {
   constructor() {}
 
   /**
@@ -131,19 +131,79 @@ class MeController {
    * @param {RequestWithUser} req
    * @param {Response} res
    */
-  async getBookmarksForLibraryItem(req, res) {
-    const libraryItem = await Database.libraryItemModel.getExpandedById(req.params.libraryItemId)
+  async checkBookmarks(libraryItemId, user, bookmark = null) {
+    const libraryItem = await Database.libraryItemModel.getExpandedById(libraryItemId)
     if (!libraryItem) {
-      return res.sendStatus(404)
+      return { status: 404, error: 'Library item not found' }
     }
 
-    if (!req.user.checkCanAccessLibraryItem(libraryItem)) {
-      Logger.error(`[MeController] User "${req.user.username}" attempted to access bookmarks for library item "${req.params.libraryItemId}" without access`)
-      return res.sendStatus(403)
+    if (!user.checkCanAccessLibraryItem(libraryItem)) {
+      Logger.error(`[MeController] User "${user.username}" attempted to access bookmarks for library item "${libraryItemId}" without access`)
+      return { status: 403, error: 'Forbidden' }
     }
 
-    const bookmarks = req.user.bookmarks?.filter((bookmark) => bookmark.libraryItemId === libraryItem.id).map((bookmark) => ({ ...bookmark })) || []
+    if (bookmark) {
+      const duration = libraryItem.media?.getPlaybackDuration?.() ?? libraryItem.media?.duration
+      if (!Number.isFinite(bookmark.time) || bookmark.time < 0 || !Number.isFinite(duration) || bookmark.time > duration) {
+        Logger.error('[MeController] Invalid bookmark time', bookmark.time)
+        return { status: 400, error: 'Invalid time' }
+      }
+      if (Object.prototype.hasOwnProperty.call(bookmark, 'title') && (!bookmark.title || typeof bookmark.title !== 'string')) {
+        Logger.error('[MeController] Invalid bookmark title', bookmark.title)
+        return { status: 400, error: 'Invalid title' }
+      }
+    }
+
+    return { libraryItem }
+  }
+
+  /**
+   * GET: /api/me/bookmarks/:libraryItemId
+   *
+   * @param {RequestWithUser} req
+   * @param {Response} res
+   */
+  async getBookmarksForLibraryItem(req, res) {
+    const result = await MeController.checkBookmarks(req.params.libraryItemId, req.user)
+    if (result.status) {
+      return res.sendStatus(result.status)
+    }
+    const bookmarks = req.user.bookmarks?.filter((bookmark) => bookmark.libraryItemId === result.libraryItem.id).map((bookmark) => ({ ...bookmark })) || []
     res.json({ bookmarks })
+  }
+
+  /**
+   * Format versioned bookmark export data.
+   *
+   * @param {string} libraryItemId
+   * @param {import('../models/User').AudioBookmarkObject[]} bookmarks
+   * @returns {{ schemaVersion: number, libraryItemId: string, exportedAt: string, bookmarks: import('../models/User').AudioBookmarkObject[] }}
+   */
+  formatBookmarkOutput(libraryItemId, bookmarks) {
+    return {
+      schemaVersion: 1,
+      libraryItemId,
+      exportedAt: new Date().toISOString(),
+      bookmarks: bookmarks.slice(0, 100).map((bookmark) => ({ ...bookmark }))
+    }
+  }
+
+  /**
+   * GET: /api/me/item/:id/bookmarks/export
+   *
+   * @param {RequestWithUser} req
+   * @param {Response} res
+   */
+  async exportBookmark(req, res) {
+    const result = await MeController.checkBookmarks(req.params.id, req.user)
+    if (result.status) {
+      return res.sendStatus(result.status)
+    }
+
+    const bookmarks = req.user.bookmarks?.filter((bookmark) => bookmark.libraryItemId === result.libraryItem.id) || []
+    const output = MeController.formatBookmarkOutput(req.params.id, bookmarks)
+    res.setHeader('Content-Disposition', `attachment; filename="bookmarks-${req.params.id}.json"`)
+    res.type('application/json').send(JSON.stringify(output, null, 2))
   }
 
   /**
@@ -325,27 +385,12 @@ class MeController {
    * @param {Response} res
    */
   async createBookmark(req, res) {
-    const libraryItem = await Database.libraryItemModel.getExpandedById(req.params.id)
-    if (!libraryItem) {
-      return res.sendStatus(404)
-    }
-
-    // Check if user has access to this library item
-    if (!req.user.checkCanAccessLibraryItem(libraryItem)) {
-      Logger.error(`[MeController] User "${req.user.username}" attempted to create bookmark for library item "${req.params.id}" without access`)
-      return res.sendStatus(403)
+    const validation = await MeController.checkBookmarks(req.params.id, req.user, req.body)
+    if (validation.status) {
+      return validation.status === 400 ? res.status(400).send(validation.error) : res.sendStatus(validation.status)
     }
 
     const { time, title } = req.body
-    if (isNullOrNaN(time)) {
-      Logger.error(`[MeController] createBookmark invalid time`, time)
-      return res.status(400).send('Invalid time')
-    }
-    if (!title || typeof title !== 'string') {
-      Logger.error(`[MeController] createBookmark invalid title`, title)
-      return res.status(400).send('Invalid title')
-    }
-
     const bookmark = await req.user.createBookmark(req.params.id, time, title)
     SocketAuthority.clientEmitter(req.user.id, 'user_updated', req.user.toOldJSONForBrowser())
     res.json(bookmark)
@@ -358,27 +403,12 @@ class MeController {
    * @param {Response} res
    */
   async updateBookmark(req, res) {
-    const libraryItem = await Database.libraryItemModel.getExpandedById(req.params.id)
-    if (!libraryItem) {
-      return res.sendStatus(404)
-    }
-
-    // Check if user has access to this library item
-    if (!req.user.checkCanAccessLibraryItem(libraryItem)) {
-      Logger.error(`[MeController] User "${req.user.username}" attempted to update bookmark for library item "${req.params.id}" without access`)
-      return res.sendStatus(403)
+    const validation = await MeController.checkBookmarks(req.params.id, req.user, req.body)
+    if (validation.status) {
+      return validation.status === 400 ? res.status(400).send(validation.error) : res.sendStatus(validation.status)
     }
 
     const { time, title } = req.body
-    if (isNullOrNaN(time)) {
-      Logger.error(`[MeController] updateBookmark invalid time`, time)
-      return res.status(400).send('Invalid time')
-    }
-    if (!title || typeof title !== 'string') {
-      Logger.error(`[MeController] updateBookmark invalid title`, title)
-      return res.status(400).send('Invalid title')
-    }
-
     const bookmark = await req.user.updateBookmark(req.params.id, time, title)
     if (!bookmark) {
       Logger.error(`[MeController] updateBookmark not found for library item id "${req.params.id}" and time "${time}"`)
@@ -396,20 +426,10 @@ class MeController {
    * @param {Response} res
    */
   async removeBookmark(req, res) {
-    const libraryItem = await Database.libraryItemModel.getExpandedById(req.params.id)
-    if (!libraryItem) {
-      return res.sendStatus(404)
-    }
-
-    // Check if user has access to this library item
-    if (!req.user.checkCanAccessLibraryItem(libraryItem)) {
-      Logger.error(`[MeController] User "${req.user.username}" attempted to remove bookmark for library item "${req.params.id}" without access`)
-      return res.sendStatus(403)
-    }
-
     const time = Number(req.params.time)
-    if (isNaN(time)) {
-      return res.status(400).send('Invalid time')
+    const validation = await MeController.checkBookmarks(req.params.id, req.user, { time })
+    if (validation.status) {
+      return validation.status === 400 ? res.status(400).send(validation.error) : res.sendStatus(validation.status)
     }
 
     if (!req.user.findBookmark(req.params.id, time)) {
@@ -654,4 +674,5 @@ class MeController {
     res.json(data)
   }
 }
-module.exports = new MeController()
+const MeController = new MeControllerClass()
+module.exports = MeController

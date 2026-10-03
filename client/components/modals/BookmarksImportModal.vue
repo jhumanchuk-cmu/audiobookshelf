@@ -38,7 +38,7 @@
       </div>
       <div class="flex justify-end gap-2 border-t border-white/10 px-5 py-4">
         <ui-btn @click="cancel">{{ $strings.ButtonCancel }}</ui-btn>
-        <ui-btn v-if="preview" color="bg-success" :disabled="applying || (!preview.newBookmarks.length && !hasReplacements)" :loading="applying" @click="applyImport">{{ $strings.ButtonImport }}</ui-btn>
+        <ui-btn v-if="preview" color="bg-success" :disabled="applying" :loading="applying" @click="applyImport">{{ $strings.ButtonImport }}</ui-btn>
       </div>
     </div>
   </modals-modal>
@@ -67,9 +67,6 @@ export default {
       set(value) {
         this.$emit('input', value)
       }
-    },
-    hasReplacements() {
-      return Object.values(this.conflictChoices).some((choice) => choice === 'replace')
     }
   },
   watch: {

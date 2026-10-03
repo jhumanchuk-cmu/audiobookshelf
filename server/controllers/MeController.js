@@ -178,15 +178,17 @@ class MeControllerClass {
    * GET: /api/me/bookmarks/:libraryItemId
    *
    * @param {RequestWithUser} req
-   * @param {Response} res
+   * @param {Response} [res]
    */
-  async getBookmarksForLibraryItem(req, res) {
+  async getBookmarksForLibraryItem(req, res = null) {
     const result = await MeController.checkBookmarks(req.params.libraryItemId, req.user)
     if (result.status) {
+      if (!res) return result
       return res.sendStatus(result.status)
     }
     const bookmarks = req.user.bookmarks?.filter((bookmark) => bookmark.libraryItemId === result.libraryItem.id).map((bookmark) => ({ ...bookmark })) || []
-    res.json({ bookmarks })
+    if (!res) return { libraryItem: result.libraryItem, bookmarks }
+    return res.json({ bookmarks })
   }
 
   /**
@@ -367,15 +369,17 @@ class MeControllerClass {
    * @param {Response} res
    */
   async exportBookmark(req, res) {
-    // Reuse item existence and access checks before preparing the download.
-    const result = await MeController.checkBookmarks(req.params.id, req.user)
+    // Reuse the existing item bookmark handler to retrieve checked bookmarks.
+    const result = await MeController.getBookmarksForLibraryItem({
+      params: { libraryItemId: req.params.id },
+      user: req.user
+    })
     if (result.status) {
       return res.sendStatus(result.status)
     }
 
     // Serialize only this item's bookmarks and mark the response as a JSON attachment.
-    const bookmarks = req.user.bookmarks?.filter((bookmark) => bookmark.libraryItemId === result.libraryItem.id) || []
-    const output = MeController.formatBookmarkOutput(req.params.id, bookmarks)
+    const output = MeController.formatBookmarkOutput(req.params.id, result.bookmarks)
     res.setHeader('Content-Disposition', `attachment; filename="bookmarks-${req.params.id}.json"`)
     // Send a downloadable, pretty-printed JSON representation.
     res.type('application/json').send(JSON.stringify(output, null, 2))

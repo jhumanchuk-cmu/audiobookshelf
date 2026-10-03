@@ -143,6 +143,7 @@
 
     <modals-podcast-episode-feed v-model="showPodcastEpisodeFeed" :library-item="libraryItem" :episodes="podcastFeedEpisodes" :download-queue="episodeDownloadsQueued" :episodes-downloading="episodesDownloading" />
     <modals-bookmarks-modal v-model="showBookmarksModal" :bookmarks="bookmarks" :playback-rate="1" :library-item-id="libraryItemId" hide-create @select="selectBookmark" />
+    <modals-bookmarks-import-modal v-model="showBookmarksImportModal" :library-item-id="libraryItemId" />
   </div>
 </template>
 
@@ -181,6 +182,7 @@ export default {
       episodesDownloading: [],
       episodeDownloadsQueued: [],
       showBookmarksModal: false,
+      showBookmarksImportModal: false,
       isDescriptionClamped: false,
       showFullDescription: false
     }
@@ -393,6 +395,10 @@ export default {
         items.push({
           text: this.$strings.LabelExportBookmarks,
           action: 'export-bookmarks'
+        })
+        items.push({
+          text: this.$strings.LabelImportBookmarks,
+          action: 'import-bookmarks'
         })
       }
 
@@ -774,6 +780,8 @@ export default {
         this.showBookmarksModal = true
       } else if (action === 'export-bookmarks') {
         this.exportBookmarks()
+      } else if (action === 'import-bookmarks') {
+        this.showBookmarksImportModal = true
       } else if (action === 'rss-feeds') {
         this.clickRSSFeed()
       } else if (action === 'download') {
@@ -788,11 +796,13 @@ export default {
       }
     },
     async exportBookmarks() {
+      // Suggest a safe filename based on the book title.
       const safeTitle = this.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'book'
       const filename = `${safeTitle}-bookmarks.json`
 
       try {
         let fileHandle = null
+        // Use the native save picker when available so the user can choose a path and name.
         if (window.showSaveFilePicker) {
           fileHandle = await window.showSaveFilePicker({
             suggestedName: filename,
@@ -800,12 +810,15 @@ export default {
           })
         }
 
+        // Fetch the JSON attachment after the save location is selected.
         const file = await this.$axios.$get(`/api/me/item/${this.libraryItemId}/bookmarks/export`, { responseType: 'blob' })
         if (fileHandle) {
+          // Write directly to the selected destination.
           const writable = await fileHandle.createWritable()
           await writable.write(file)
           await writable.close()
         } else {
+          // Fall back to a standard browser download where the save picker is unavailable.
           const fileUrl = URL.createObjectURL(file)
           const link = document.createElement('a')
           link.href = fileUrl
@@ -818,6 +831,7 @@ export default {
         this.$toast.success(this.$strings.ToastExportBookmarksSuccess)
       } catch (error) {
         if (error.name === 'AbortError') return
+        // Distinguish a user-cancelled save dialog from a failed export.
         this.$toast.error(this.$strings.ToastExportBookmarksFailed)
         console.error('Failed to export bookmarks', error)
       }

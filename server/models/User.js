@@ -850,14 +850,14 @@ class User extends Model {
    * @param {string} title
    * @returns {Promise<AudioBookmarkObject>}
    */
-  async createBookmark(libraryItemId, time, title) {
+  async createBookmark(libraryItemId, time, title, createdAt = Date.now(), options = {}) {
     const existingBookmark = this.findBookmark(libraryItemId, time)
     if (existingBookmark) {
       Logger.warn('[User] Create Bookmark already exists for this time')
       if (existingBookmark.title !== title) {
         existingBookmark.title = title
         this.changed('bookmarks', true)
-        await this.save()
+        await this.save(options)
       }
       return existingBookmark
     }
@@ -866,11 +866,11 @@ class User extends Model {
       libraryItemId,
       time,
       title,
-      createdAt: Date.now()
+      createdAt
     }
     this.bookmarks.push(newBookmark)
     this.changed('bookmarks', true)
-    await this.save()
+    await this.save(options)
     return newBookmark
   }
 
@@ -882,15 +882,16 @@ class User extends Model {
    * @param {string} title
    * @returns {Promise<AudioBookmarkObject>}
    */
-  async updateBookmark(libraryItemId, time, title) {
+  async updateBookmark(libraryItemId, time, title, createdAt = undefined, options = {}) {
     const bookmark = this.findBookmark(libraryItemId, time)
     if (!bookmark) {
       Logger.error(`[User] updateBookmark not found`)
       return null
     }
     bookmark.title = title
+    if (createdAt !== undefined) bookmark.createdAt = createdAt
     this.changed('bookmarks', true)
-    await this.save()
+    await this.save(options)
     return bookmark
   }
 

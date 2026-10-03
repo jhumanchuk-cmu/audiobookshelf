@@ -6,6 +6,16 @@ const Database = require('../../../server/Database')
 const MeController = require('../../../server/controllers/MeController')
 const SocketAuthority = require('../../../server/SocketAuthority')
 
+// Build the same v1 envelope emitted by the bookmark export formatter.
+function makeBookmarkFile(libraryItemId, bookmarks) {
+  return {
+    schemaVersion: 1,
+    libraryItemId,
+    exportedAt: '2026-10-02T12:00:00.000Z',
+    bookmarks
+  }
+}
+
 describe('MeController bookmarks', () => {
   let libraryItemId
   let user
@@ -120,6 +130,24 @@ describe('MeController bookmarks', () => {
 
     const invalidTitleResult = await MeController.checkBookmarks(libraryItemId, user, { time: 42, title: 123 })
     expect(invalidTitleResult.error).to.equal('Invalid title')
+
+    const invalidImportedTitleResult = await MeController.checkBookmarks(libraryItemId, user, [{ libraryItemId, time: 42, title: '' }])
+    expect(invalidImportedTitleResult.error).to.equal('Invalid title')
+    const invalidImportedItemIdResult = await MeController.checkBookmarks(libraryItemId, user, [{ libraryItemId: 'another-item', time: 42, title: 'Wrong item' }])
+    expect(invalidImportedItemIdResult.error).to.equal('Invalid bookmark entry')
+    const invalidCreatedAtResult = await MeController.checkBookmarks(libraryItemId, user, [{ libraryItemId, time: 42, title: 'Bad creation time', createdAt: 'not-a-number' }])
+    expect(invalidCreatedAtResult.error).to.equal('Invalid bookmark creation time')
+  })
+
+  it('rejects bookmark checks for missing or inaccessible library items', async () => {
+    // Missing items return 404; inaccessible items return 403 before bookmark data is checked.
+    const missingResult = await MeController.checkBookmarks('missing-library-item', user)
+    expect(missingResult.status).to.equal(404)
+
+    const accessStub = sinon.stub(user, 'checkCanAccessLibraryItem').returns(false)
+    const forbiddenResult = await MeController.checkBookmarks(libraryItemId, user)
+    expect(forbiddenResult.status).to.equal(403)
+    expect(accessStub.calledOnce).to.be.true
   })
 
   it('formats bookmark export data with a version, item ID, timestamp, and copied entries', () => {
@@ -152,6 +180,157 @@ describe('MeController bookmarks', () => {
     expect(output.bookmarks).to.have.lengthOf(100)
     expect(output.bookmarks[0].title).to.equal('Bookmark 0')
     expect(output.bookmarks[99].title).to.equal('Bookmark 99')
+  })
+
+  it('validates imported bookmark files and preserves valid entries', () => {
+    // Exported bookmarks validate and retain their original fields through an import round trip.
+    const bookmark = { libraryItemId, time: 42, title: 'Imported bookmark', createdAt: 1234 }
+    const exported = MeController.formatBookmarkOutput(libraryItemId, [bookmark])
+    const valid = MeController.validateBookmarkImport(exported, libraryItemId)
+    expect(valid.bookmarks).to.deep.equal([bookmark])
+
+    // File-level validation handles the schema, target item, record shape, duplicate times, and limit.
+    expect(MeController.validateBookmarkImport({ ...makeBookmarkFile(libraryItemId, []), schemaVersion: 2 }, libraryItemId).error).to.equal('Unsupported or invalid bookmark file')
+    expect(MeController.validateBookmarkImport(makeBookmarkFile('other-item', []), libraryItemId).error).to.equal('Unsupported or invalid bookmark file')
+    expect(MeController.validateBookmarkImport(null, libraryItemId).error).to.equal('Invalid bookmark file')
+    expect(MeController.validateBookmarkImport({ ...makeBookmarkFile(libraryItemId, []), exportedAt: 'not-a-date' }, libraryItemId).error).to.equal('Unsupported or invalid bookmark file')
+    expect(MeController.validateBookmarkImport(makeBookmarkFile(libraryItemId, [null]), libraryItemId).error).to.equal('Invalid bookmark entry')
+    expect(MeController.validateBookmarkImport(makeBookmarkFile(libraryItemId, [bookmark, bookmark]), libraryItemId).error).to.equal(`Duplicate bookmark timestamp ${bookmark.time}; each timestamp can only appear once in the file`)
+    expect(MeController.validateBookmarkImport(makeBookmarkFile(libraryItemId, Array.from({ length: 101 }, (_, time) => ({ ...bookmark, time }))), libraryItemId).error).to.equal('Bookmark file must contain no more than 100 bookmarks')
+  })
+
+  it('classifies imported bookmarks as new, matching, or conflicting', () => {
+    // Same-time/same-title entries match; an unused time is new; same-time/different-title entries conflict.
+    const imported = [
+      { libraryItemId, time: 12, title: 'Same title', createdAt: 100 },
+      { libraryItemId, time: 42, title: 'New bookmark', createdAt: 200 },
+      { libraryItemId, time: 20, title: 'Imported title', createdAt: 300 }
+    ]
+    const current = [
+      { libraryItemId, time: 12, title: 'Same title', createdAt: 100 },
+      { libraryItemId, time: 20, title: 'Existing title', createdAt: 250 }
+    ]
+    user.bookmarks = current
+
+    const comparison = MeController.compareBookmarks(imported, user)
+
+    expect(comparison.newBookmarks).to.deep.equal([imported[1]])
+    expect(comparison.matching).to.have.lengthOf(1)
+    expect(comparison.conflicts).to.deep.equal([{ existing: current[1], imported: imported[2] }])
+  })
+
+  it('returns comparison results from previewBookmarkUpdates without mutating bookmarks', async () => {
+    // The preview helper exposes new/conflicting entries and a matching count without applying changes.
+    const comparison = {
+      newBookmarks: [{ libraryItemId, time: 42, title: 'New', createdAt: 100 }],
+      conflicts: [{ existing: { time: 20, title: 'Old' }, imported: { time: 20, title: 'New' } }],
+      matching: [{ existing: { time: 12, title: 'Same' }, imported: { time: 12, title: 'Same' } }]
+    }
+    const response = { json: sinon.spy() }
+
+    await MeController.previewBookmarkUpdates(comparison, { body: { action: 'preview' } }, response)
+
+    expect(response.json.firstCall.args[0]).to.deep.equal({
+      newBookmarks: comparison.newBookmarks,
+      conflicts: comparison.conflicts,
+      matchingCount: 1
+    })
+    expect(user.bookmarks).to.be.empty
+  })
+
+  it('previews without changing bookmarks, then applies additions and selected replacements idempotently', async () => {
+    // Preview reports new and conflicting entries without persisting anything; cancellation is therefore non-destructive.
+    const existingMatch = { libraryItemId, time: 12, title: 'Same title', createdAt: 100 }
+    const existingConflict = { libraryItemId, time: 20, title: 'Keep or replace', createdAt: 200 }
+    const unrelated = { libraryItemId: 'another-item', time: 30, title: 'Unrelated', createdAt: 300 }
+    user.bookmarks = [existingMatch, existingConflict, unrelated]
+    const bookmarkFile = makeBookmarkFile(libraryItemId, [
+      { ...existingMatch },
+      { libraryItemId, time: 42, title: 'Add me', createdAt: 400 },
+      { libraryItemId, time: 20, title: 'Replacement', createdAt: 500 }
+    ])
+    const previewResponse = { json: sinon.spy() }
+    const previewStub = sinon.stub(MeController, 'previewBookmarkUpdates').callThrough()
+
+    await MeController.importBookmarks({ params: { id: libraryItemId }, body: { action: 'preview', bookmarkFile }, user }, previewResponse)
+
+    expect(previewStub.calledOnce).to.be.true
+    expect(previewResponse.json.firstCall.args[0].newBookmarks).to.have.lengthOf(1)
+    expect(previewResponse.json.firstCall.args[0].conflicts).to.have.lengthOf(1)
+    expect(previewResponse.json.firstCall.args[0].matchingCount).to.equal(1)
+    expect(user.bookmarks).to.deep.equal([existingMatch, existingConflict, unrelated])
+
+    // Apply adds the new bookmark, replaces only the chosen conflict, and retains an unrelated existing bookmark.
+    const applyResponse = { json: sinon.spy() }
+    const createBookmarkSpy = sinon.spy(user, 'createBookmark')
+    const updateBookmarkSpy = sinon.spy(user, 'updateBookmark')
+    const request = {
+      params: { id: libraryItemId },
+      body: { action: 'apply', bookmarkFile, conflictChoices: { '20': 'replace' } },
+      user
+    }
+    await MeController.importBookmarks(request, applyResponse)
+
+    expect(applyResponse.json.firstCall.args[0]).to.deep.equal({ addedCount: 1, replacedCount: 1, unchangedCount: 1 })
+    expect(createBookmarkSpy.calledOnce).to.be.true
+    expect(createBookmarkSpy.firstCall.args.slice(0, 4)).to.deep.equal([libraryItemId, 42, 'Add me', 400])
+    expect(updateBookmarkSpy.calledOnce).to.be.true
+    expect(updateBookmarkSpy.firstCall.args.slice(0, 4)).to.deep.equal([libraryItemId, 20, 'Replacement', 500])
+    expect(user.bookmarks).to.deep.include.members([
+      existingMatch,
+      { libraryItemId, time: 42, title: 'Add me', createdAt: 400 },
+      { libraryItemId, time: 20, title: 'Replacement', createdAt: 500 },
+      unrelated
+    ])
+
+    // Importing the same file and decisions again leaves the resulting list unchanged.
+    const repeatedResponse = { json: sinon.spy() }
+    await MeController.importBookmarks(request, repeatedResponse)
+    expect(repeatedResponse.json.firstCall.args[0]).to.deep.equal({ addedCount: 0, replacedCount: 0, unchangedCount: 3 })
+    expect(user.bookmarks).to.have.lengthOf(4)
+  })
+
+  it('restores the in-memory bookmark list when import persistence fails', async () => {
+    // A failed save returns an error and restores the user's pre-import bookmark list.
+    const existing = { libraryItemId, time: 12, title: 'Existing', createdAt: 100 }
+    user.bookmarks = [existing]
+    const bookmarkFile = makeBookmarkFile(libraryItemId, [{ libraryItemId, time: 42, title: 'New', createdAt: 200 }])
+    const saveStub = sinon.stub(user, 'save').rejects(new Error('database unavailable'))
+    const response = {
+      status: sinon.stub().returnsThis(),
+      send: sinon.spy()
+    }
+
+    await MeController.importBookmarks({
+      params: { id: libraryItemId },
+      body: { action: 'apply', bookmarkFile },
+      user
+    }, response)
+
+    expect(response.status.calledWith(500)).to.be.true
+    expect(response.send.calledWith('Failed to save bookmarks')).to.be.true
+    expect(user.bookmarks).to.deep.equal([existing])
+    expect(saveStub.calledOnce).to.be.true
+  })
+
+  it('rejects an invalid import file before previewing or persisting bookmarks', async () => {
+    // Unsupported files return 400 without invoking preview or mutating the user's bookmarks.
+    const previewStub = sinon.stub(MeController, 'previewBookmarkUpdates')
+    const response = {
+      status: sinon.stub().returnsThis(),
+      send: sinon.spy()
+    }
+
+    await MeController.importBookmarks({
+      params: { id: libraryItemId },
+      body: { action: 'preview', bookmarkFile: { schemaVersion: 9 } },
+      user
+    }, response)
+
+    expect(response.status.calledWith(400)).to.be.true
+    expect(response.send.calledWith('Unsupported or invalid bookmark file')).to.be.true
+    expect(previewStub.called).to.be.false
+    expect(user.bookmarks).to.be.empty
   })
 
   it('exports the current user bookmarks as a JSON attachment', async () => {

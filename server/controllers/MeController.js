@@ -8,6 +8,11 @@ const { toNumber, isUUID } = require('../utils/index')
 const userStats = require('../utils/queries/userStats')
 const parseUserAgent = require('../utils/parsers/parseUserAgent')
 
+// Maximum number of bookmarks that can be exported or imported in a single file. This limit is
+// enforced to prevent excessively large files and to ensure performance and stability during
+// bookmark operations.
+const MAX_BOOKMARKS_PER_FILE = 100
+
 /**
  * @typedef RequestUserObject
  * @property {import('../models/User')} user
@@ -132,25 +137,37 @@ class MeControllerClass {
    * @param {Response} res
    */
   async checkBookmarks(libraryItemId, user, bookmark = null) {
+    // Resolve the item before checking permissions or bookmark details.
     const libraryItem = await Database.libraryItemModel.getExpandedById(libraryItemId)
     if (!libraryItem) {
       return { status: 404, error: 'Library item not found' }
     }
 
+    // Refuse bookmark operations for items outside the user's permissions.
     if (!user.checkCanAccessLibraryItem(libraryItem)) {
       Logger.error(`[MeController] User "${user.username}" attempted to access bookmarks for library item "${libraryItemId}" without access`)
       return { status: 403, error: 'Forbidden' }
     }
 
+    // Validate one bookmark or a batch against this item's duration and expected shape.
     if (bookmark) {
       const duration = libraryItem.media?.getPlaybackDuration?.() ?? libraryItem.media?.duration
-      if (!Number.isFinite(bookmark.time) || bookmark.time < 0 || !Number.isFinite(duration) || bookmark.time > duration) {
-        Logger.error('[MeController] Invalid bookmark time', bookmark.time)
-        return { status: 400, error: 'Invalid time' }
-      }
-      if (Object.prototype.hasOwnProperty.call(bookmark, 'title') && (!bookmark.title || typeof bookmark.title !== 'string')) {
-        Logger.error('[MeController] Invalid bookmark title', bookmark.title)
-        return { status: 400, error: 'Invalid title' }
+      const bookmarks = Array.isArray(bookmark) ? bookmark : [bookmark]
+      for (const entry of bookmarks) {
+        if (!entry || typeof entry !== 'object' || (Array.isArray(bookmark) ? entry.libraryItemId !== libraryItem.id : entry.libraryItemId && entry.libraryItemId !== libraryItem.id)) {
+          return { status: 400, error: 'Invalid bookmark entry' }
+        }
+        if (!Number.isFinite(entry.time) || entry.time < 0 || !Number.isFinite(duration) || entry.time > duration) {
+          Logger.error('[MeController] Invalid bookmark time', entry.time)
+          return { status: 400, error: 'Invalid time' }
+        }
+        if ((Array.isArray(bookmark) || Object.prototype.hasOwnProperty.call(entry, 'title')) && (!entry.title || typeof entry.title !== 'string')) {
+          Logger.error('[MeController] Invalid bookmark title', entry.title)
+          return { status: 400, error: 'Invalid title' }
+        }
+        if (entry.createdAt !== undefined && !Number.isFinite(entry.createdAt)) {
+          return { status: 400, error: 'Invalid bookmark creation time' }
+        }
       }
     }
 
@@ -180,12 +197,167 @@ class MeControllerClass {
    * @returns {{ schemaVersion: number, libraryItemId: string, exportedAt: string, bookmarks: import('../models/User').AudioBookmarkObject[] }}
    */
   formatBookmarkOutput(libraryItemId, bookmarks) {
+    // Attach v1 metadata and copy no more than the supported export limit.
     return {
       schemaVersion: 1,
       libraryItemId,
       exportedAt: new Date().toISOString(),
-      bookmarks: bookmarks.slice(0, 100).map((bookmark) => ({ ...bookmark }))
+      bookmarks: bookmarks.slice(0, MAX_BOOKMARKS_PER_FILE).map((bookmark) => ({ ...bookmark }))
     }
+  }
+
+  /**
+    * Validate the versioned file envelope and its record collection.
+   *
+   * @param {object} bookmarkFile
+   * @param {string} libraryItemId
+   * @returns {{ bookmarks?: object[], error?: string }}
+   */
+  validateBookmarkImport(bookmarkFile, libraryItemId) {
+    // Reject non-object input before reading versioned file properties.
+    if (!bookmarkFile || typeof bookmarkFile !== 'object' || Array.isArray(bookmarkFile)) {
+      return { error: 'Invalid bookmark file' }
+    }
+    // Confirm the file's schema version, target item, and creation timestamp.
+    if (bookmarkFile.schemaVersion !== 1 || bookmarkFile.libraryItemId !== libraryItemId || typeof bookmarkFile.exportedAt !== 'string' || !Number.isFinite(Date.parse(bookmarkFile.exportedAt))) {
+      return { error: 'Unsupported or invalid bookmark file' }
+    }
+    // Enforce the same maximum supported by export.
+    if (!Array.isArray(bookmarkFile.bookmarks) || bookmarkFile.bookmarks.length > MAX_BOOKMARKS_PER_FILE) {
+      return { error: `Bookmark file must contain no more than ${MAX_BOOKMARKS_PER_FILE} bookmarks` }
+    }
+
+    // Check record shape and reject duplicate timestamps; checkBookmarks owns bookmark field validation.
+    const seenTimes = new Set()
+    for (const bookmark of bookmarkFile.bookmarks) {
+      if (!bookmark || typeof bookmark !== 'object' || Array.isArray(bookmark)) {
+        return { error: 'Invalid bookmark entry' }
+      }
+      if (seenTimes.has(bookmark.time)) {
+        return { error: `Duplicate bookmark timestamp ${bookmark.time}; each timestamp can only appear once in the file` }
+      }
+      seenTimes.add(bookmark.time)
+    }
+
+    // Return copies so later comparison or import work cannot mutate the parsed payload.
+    return { bookmarks: bookmarkFile.bookmarks.map((bookmark) => ({ ...bookmark })) }
+  }
+
+  /**
+   * Compare imported entries with the current bookmarks for one item.
+   *
+   * @param {object[]} importedBookmarks
+   * @param {object[]} currentBookmarks
+   */
+  compareBookmarks(importedBookmarks, user) {
+    // Classify each import by timestamp and title without mutating either input list.
+    const comparison = { newBookmarks: [], conflicts: [], matching: [] }
+
+    for (const importedBookmark of importedBookmarks) {
+      const existingBookmark = user.findBookmark(importedBookmark.libraryItemId, importedBookmark.time)
+      if (!existingBookmark) {
+        comparison.newBookmarks.push(importedBookmark)
+      } else if (existingBookmark.title === importedBookmark.title) {
+        comparison.matching.push({ existing: existingBookmark, imported: importedBookmark })
+      } else {
+        comparison.conflicts.push({ existing: existingBookmark, imported: importedBookmark })
+      }
+    }
+
+    return comparison
+  }
+
+  /**
+   * Send the new, conflicting, and matching bookmark results to the preview UI.
+   *
+   * @param {{ newBookmarks: object[], conflicts: object[], matching: object[] }} comparison
+   * @param {RequestWithUser} req
+   * @param {Response} res
+   */
+  async previewBookmarkUpdates(comparison, req, res) {
+    if (req.body.action !== 'apply') {
+      // Return only the preview details needed for user review and conflict choices.
+      return res.json({
+        newBookmarks: comparison.newBookmarks,
+        conflicts: comparison.conflicts,
+        matchingCount: comparison.matching.length
+      })
+    }
+
+    // Keep only conflicts the user explicitly chose to replace.
+    const conflictChoices = req.body.conflictChoices || {}
+    const replacements = comparison.conflicts.filter((conflict) => conflictChoices[String(conflict.imported.time)] === 'replace')
+    const additions = comparison.newBookmarks
+    if (!additions.length && !replacements.length) {
+      return res.json({ addedCount: 0, replacedCount: 0, unchangedCount: comparison.matching.length + comparison.conflicts.length })
+    }
+
+    // Snapshot the list so failed persistence can restore the current in-memory state.
+    const user = req.user
+    const originalBookmarks = (user.bookmarks || []).map((bookmark) => ({ ...bookmark }))
+    try {
+      // Apply all selected changes in one transaction using the existing bookmark model operations.
+      await Database.sequelize.transaction(async (transaction) => {
+        for (const bookmark of additions) {
+          await user.createBookmark(req.params.id, bookmark.time, bookmark.title, bookmark.createdAt ?? Date.now(), { transaction })
+        }
+        for (const conflict of replacements) {
+          const importedBookmark = conflict.imported
+          const updatedBookmark = await user.updateBookmark(
+            req.params.id,
+            importedBookmark.time,
+            importedBookmark.title,
+            importedBookmark.createdAt,
+            { transaction }
+          )
+          if (!updatedBookmark) {
+            throw new Error(`Bookmark at ${importedBookmark.time} was not found during import`)
+          }
+        }
+      })
+    } catch (error) {
+      // Restore memory after the database transaction rolls back.
+      user.bookmarks = originalBookmarks
+      user.changed('bookmarks', true)
+      Logger.error('[MeController] Failed to persist imported bookmarks', error)
+      return res.status(500).send('Failed to save bookmarks')
+    }
+
+    // Notify connected clients after the transaction commits.
+    SocketAuthority.clientEmitter(user.id, 'user_updated', user.toOldJSONForBrowser())
+    return res.json({
+      addedCount: additions.length,
+      replacedCount: replacements.length,
+      unchangedCount: comparison.matching.length + comparison.conflicts.length - replacements.length
+    })
+  }
+
+  /**
+   * POST: /api/me/item/:id/bookmarks/import
+   * Preview entries with action "preview"; apply selected conflicts with action "apply".
+   *
+   * @param {RequestWithUser} req
+   * @param {Response} res
+   */
+  async importBookmarks(req, res) {
+    // Accept only the two supported stages of the import workflow.
+    if (req.body?.action && !['preview', 'apply'].includes(req.body.action)) {
+      return res.status(400).send('Invalid import action')
+    }
+
+    // Validate the file envelope before passing entries to the shared item and bookmark checks.
+    const validation = MeController.validateBookmarkImport(req.body?.bookmarkFile, req.params.id)
+    if (validation.error) {
+      return res.status(400).send(validation.error)
+    }
+    // Resolve item access and validate every bookmark in one database lookup.
+    const bookmarksCheck = await MeController.checkBookmarks(req.params.id, req.user, validation.bookmarks)
+    if (bookmarksCheck.status) {
+      return bookmarksCheck.status === 400 ? res.status(400).send(bookmarksCheck.error) : res.sendStatus(bookmarksCheck.status)
+    }
+
+    const comparison = MeController.compareBookmarks(validation.bookmarks, req.user)
+    return MeController.previewBookmarkUpdates(comparison, req, res)
   }
 
   /**
@@ -195,14 +367,17 @@ class MeControllerClass {
    * @param {Response} res
    */
   async exportBookmark(req, res) {
+    // Reuse item existence and access checks before preparing the download.
     const result = await MeController.checkBookmarks(req.params.id, req.user)
     if (result.status) {
       return res.sendStatus(result.status)
     }
 
+    // Serialize only this item's bookmarks and mark the response as a JSON attachment.
     const bookmarks = req.user.bookmarks?.filter((bookmark) => bookmark.libraryItemId === result.libraryItem.id) || []
     const output = MeController.formatBookmarkOutput(req.params.id, bookmarks)
     res.setHeader('Content-Disposition', `attachment; filename="bookmarks-${req.params.id}.json"`)
+    // Send a downloadable, pretty-printed JSON representation.
     res.type('application/json').send(JSON.stringify(output, null, 2))
   }
 
